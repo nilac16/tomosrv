@@ -7,6 +7,10 @@
 #include <windows.h>
 #include <csv.h>
 
+#ifndef STDC_FILE_IO
+#   define STDC_FILE_IO 0
+#endif
+
 
 /** @brief Get the size of @p hfile in bytes
  *  @param hfile
@@ -15,6 +19,29 @@
  *      Length of the file is written here
  *  @returns Nonzero on error
  */
+#if STDC_FILE_IO
+static int tomo_csv_file_size(FILE *fp, size_t *len)
+{
+    static const wchar_t *failmsg = L"Cannot get file size";
+    long tell;
+
+    if (fseek(fp, 0, SEEK_END)) {
+        tomo_error_raise(TOMO_ERROR_SYS, NULL, failmsg);
+        return 1;
+    }
+    tell = ftell(fp);
+    if (tell < 0) {
+        tomo_error_raise(TOMO_ERROR_SYS, NULL, failmsg);
+        return 1;
+    }
+    if (fseek(fp, 0, SEEK_SET)) {
+        tomo_error_raise(TOMO_ERROR_SYS, NULL, failmsg);
+        return 1;
+    }
+    *len = tell;
+    return 0;
+}
+#else
 static int tomo_csv_file_size(HANDLE hfile, size_t *len)
 {
     static const wchar_t *failmsg = L"Cannot get file size";
@@ -27,6 +54,7 @@ static int tomo_csv_file_size(HANDLE hfile, size_t *len)
     *len = size.QuadPart;
     return 0;
 }
+#endif
 
 
 /** @brief Opens a read-only HANDLE to the file at @p path
@@ -34,6 +62,22 @@ static int tomo_csv_file_size(HANDLE hfile, size_t *len)
  *      Path to file
  *  @returns The opened HANDLE or INVALID_HANDLE_VALUE on failure
  */
+#if STDC_FILE_IO
+static FILE *tomo_csv_open(const wchar_t *path, size_t *len)
+{
+    static const wchar_t *failfmt = L"Failed to open %s";
+    FILE *res;
+
+    res = _wfopen(path, L"rb");
+    if (!res) {
+        tomo_error_raise(TOMO_ERROR_SYS, NULL, failfmt, path);
+    } else if (tomo_csv_file_size(res, len)) {
+        fclose(res);
+        res = NULL;
+    }
+    return res;
+}
+#else
 static HANDLE tomo_csv_open(const wchar_t *path, size_t *len)
 {
     static const wchar_t *failfmt = L"Failed to open %s";
@@ -41,10 +85,10 @@ static HANDLE tomo_csv_open(const wchar_t *path, size_t *len)
 
     res = CreateFile(path,
                      GENERIC_READ,
-                     FILE_SHARE_READ,
+                     FILE_SHARE_READ | FILE_SHARE_WRITE,
                      NULL,
                      OPEN_EXISTING,
-                     FILE_FLAG_NO_BUFFERING,
+                     FILE_ATTRIBUTE_NORMAL,
                      NULL);
     if (res == INVALID_HANDLE_VALUE) {
         tomo_error_raise(TOMO_ERROR_WIN32, NULL, failfmt, path);
@@ -54,15 +98,13 @@ static HANDLE tomo_csv_open(const wchar_t *path, size_t *len)
     }
     return res;
 }
+#endif
 
 
 /** @brief Allocates memory for the file
  *  @param len
  *      Size of the required mapping
  *  @returns A pointer to the allocated block, or NULL on failure
- *  @note There is an assumption here that the system page size is larger than
- *      the relevant disk's sector size... Probably not going to be an issue,
- *      and I don't feel like going through the mess of finding the sector size
  */
 static void *tomo_csv_alloc(size_t len)
 {
@@ -88,13 +130,27 @@ static void *tomo_csv_alloc(size_t len)
  *      Size of the file
  *  @returns Nonzero on error
  */
+#if STDC_FILE_IO
+static int tomo_csv_buffer(FILE *fp, void *dst, size_t len)
+{
+    static const wchar_t *failmsg = L"Failed reading CSV file";
+    size_t count;
+
+    count = fread(dst, 1UL, len, fp);
+    if (count < len) {
+        tomo_error_raise(TOMO_ERROR_SYS, NULL, failmsg);
+        return 1;
+    }
+    return 0;
+}
+#else
 static int tomo_csv_buffer(HANDLE hfile, void *dst, size_t len)
 {
     static const wchar_t *failmsg = L"Failed reading CSV file";
     DWORD count, nread;
 
     do {
-        count = (DWORD)len; /* Truncate */
+        count = (DWORD)len;
         if (!ReadFile(hfile, dst, count, &nread, NULL)) {
             tomo_error_raise(TOMO_ERROR_WIN32, NULL, failmsg);
             return 1;
@@ -107,6 +163,7 @@ static int tomo_csv_buffer(HANDLE hfile, void *dst, size_t len)
     } while (len);
     return 0;
 }
+#endif
 
 
 /** @brief Buffer the file at @p path onto the heap
@@ -116,6 +173,26 @@ static int tomo_csv_buffer(HANDLE hfile, void *dst, size_t len)
  *      The length of the file will be written here
  */
 static void *tomo_csv_read(const wchar_t *path, size_t *len)
+#if STDC_FILE_IO
+{
+    FILE *fp;
+    void *res;
+
+    fp = tomo_csv_open(path, len);
+    if (!fp) {
+        return NULL;
+    }
+    res = tomo_csv_alloc(*len);
+    if (res) {
+        if (tomo_csv_buffer(fp, res, *len)) {
+            VirtualFree(res, 0, MEM_RELEASE);
+            res = NULL;
+        }
+    }
+    fclose(fp);
+    return res;
+}
+#else
 {
     HANDLE hfile;
     void *res;
@@ -134,6 +211,7 @@ static void *tomo_csv_read(const wchar_t *path, size_t *len)
     CloseHandle(hfile);
     return res;
 }
+#endif
 
 
 struct parse_ctx {
